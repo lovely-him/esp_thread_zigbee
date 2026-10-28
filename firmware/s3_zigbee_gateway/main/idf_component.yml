@@ -1,0 +1,14 @@
+## IDF Component Manager Manifest File
+dependencies:
+  ## Required IDF version
+  espressif/esp_rcp_update: "~1.6.0"
+  idf:
+    version: ">=5.2"
+  espressif/esp-zigbee-lib:
+    version: ">=2.0.0"
+  example_common:
+    path: "../../utils/example_common"
+  light_driver:
+    path: "../../utils/light_driver"
+  protocol_examples_common:
+    path: "${IDF_PATH}/examples/common_components/protocol_examples_common"

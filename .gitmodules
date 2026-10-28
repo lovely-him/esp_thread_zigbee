@@ -1,0 +1,4 @@
+[submodule "sdk/esp-zigbee-sdk"]
+	path = sdk/esp-zigbee-sdk
+	url = https://github.com/espressif/esp-zigbee-sdk.git
+	branch = main
