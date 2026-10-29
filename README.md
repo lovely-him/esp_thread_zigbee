@@ -68,6 +68,11 @@
 - **由 S3 间接烧录**，不使用外部烧录器：S3 用 GPIO7(RESET) / GPIO8(BOOT) 让 H2 进下载模式，经 UART 写入。
 - 烧录完成后 H2 以 USB RCP 身份对 HAOS 呈现串口，HAOS 的 OTBR add-on 接管协议栈；
   **S3 不参与任何无线电工作**，也不占用 UART0（否则无法再次刷 H2）。
+- HAOS 侧 OTBR app 配置：`device` 选 H2 的 `/dev/serial/by-id/usb-Espressif_USB_JTAG_...-if00`、
+  `baudrate=115200`、`flow_control=false`（理由见坑 23、24）。
+- 生效判据是**两条**：`Role detached -> leader` **且** `Backbone Router becomes Primary!`；
+  只出现 leader 不代表 Border Routing 可用（曾经在 leader 后 5 分钟因 USB EOF 退出）。
+- 本机快速自检用 `script/verify-thread/verify-thread.sh`（直调官方 otbr-agent，不含 addon 附加参数）。
 
 ### R3 — Zigbee 模式：H2 烧 UART RCP
 
@@ -220,13 +225,15 @@ rcp_fw,     data, spiffs,  0x3A0000,  0x100000
 
 | 命令 | 用途 |
 | --- | --- |
-| `script/probe/probe.sh` | `env` / `ports` / `list`：by-id 解析 H2、S3 端口 |
+| `script/probe/probe.sh` | `env` / `ports` / `list`：by-id 解析 H2、S3、C6 端口 |
 | `script/build-h2/build-h2.sh` | 编译 H2 的 `thread_usb` / `zigbee_uart` 变体 |
+| `script/build-c6/build-c6.sh` | 编译 C6 的 `thread_usb` 变体（单芯片方案） |
 | `script/build-s3/build-s3.sh` | 编译 Zigbee 网关（目标 `ota_0`） |
 | `script/build-boot/build-boot.sh` | 编译引导程序（目标 `factory`） |
 | `script/pack-rcp/pack-rcp.sh` | 打包两份 H2 镜像为 SPIFFS 镜像 `out/rcp_fw.bin` |
 | `script/flash-s3/flash-s3.sh` | 烧写 S3 全部分区（`--erase` 先整片擦除） |
-| `script/verify-thread/verify-thread.sh` | 用官方 otbr-agent 验证 Thread 模式 USB RCP |
+| `script/flash-c6/flash-c6.sh` | 烧写 C6 的 USB RCP 固件（`--erase` 先整片擦除） |
+| `script/verify-thread/verify-thread.sh` | 用官方 otbr-agent 验证 Thread 模式 USB RCP（判据：spinel 握手 + `leader` + `BBR Primary`） |
 | `script/gen-cpp-index/gen-cpp-index.sh` | 生成 `.vscode/c_cpp_properties.json`（每个工程一个 configuration） |
 
 **禁止在 `$IDF_PATH/examples/` 下直接编译**：例程一律拷贝到本仓库 `firmware/` 内再构建，
@@ -234,11 +241,15 @@ IDF 仓库保持只读参考。
 
 ---
 
-## 6. H2 侧工程
+## 6. RCP 侧工程（H2 / C6）
 
 | 工程 | 来源 | 变体 |
 | --- | --- | --- |
 | `firmware/h2_rcp` | `$IDF_PATH/examples/openthread/ot_rcp` | `sdkconfig.defaults.thread_usb` / `sdkconfig.defaults.zigbee_uart` |
+| `firmware/c6_rcp` | `$IDF_PATH/examples/openthread/ot_rcp` | `sdkconfig.defaults.thread_usb` |
+
+- `firmware/c6_rcp` 是**单芯片方案**：C6 直接以 USB RCP 交给 HAOS 的 `otbr-agent`，不经 S3、不经 UART。
+  源码与 `h2_rcp` 同源，差别只有 target（`esp32c6`）与 flash 大小（8 MB，factory 1 MB）。
 
 - 两个变体**必须用彼此独立的 `SDKCONFIG`**：
   `idf.py -B build_usb -D SDKCONFIG=$PWD/build_usb/sdkconfig`（`export SDKCONFIG=` 不生效）。
@@ -281,7 +292,7 @@ IDF 仓库保持只读参考。
 | A1 | 纯上电不按 BOOT | 3 次上电，模式保持不变，H2 固件与模式匹配 | ✅ |
 | A2 | 长按切换 | 窗口内长按 BOOT 2 s，Thread→Zigbee→Thread 各 5 次，每次重启后模式正确、H2 固件正确 | ✅ |
 | A3 | 间接烧录 | 全程不使用 esptool 直连 H2 烧固件（Thread 模式下 USB1 仅作为 HAOS 的数据口），H2 仍能复位并升级 | ✅ |
-| A4 | Thread 闭环 | HAOS OTBR add-on 日志出现 `RCP_HOS` + `Set state callback: OK` + `BorderAgent Registering service` | ⚠ 仅验证到 otbr-agent 侧，HAOS 的 OTBR add-on 未验证 |
+| A4 | Thread 闭环 | HAOS 的 OTBR app 能打开 H2 的 by-id 串口、完成 spinel 握手（`PROP_VALUE_IS` 回 LAST_STATUS=112、`PROP_VALUE_GET(HWADDR)` 回读到 H2 EUI64），`otbr-agent` 达到 `Role detached -> leader` **且打出 `Backbone Router becomes Primary!`** | ✅ |
 | A5 | Zigbee 闭环 | S3 日志 `ESP_RADIO_SPINEL ... enabled`、RCP 版本为 `esp32h2`、Sta IP 获取成功、Zigbee 网络形成 | ✅ |
 | A6 | 刷写失败可恢复 | 切换途中拔电/超时，下次上电自动重试，不死循环、不变砖 | ⬜ |
 | A7 | 稳定性 | 反复上电 20 次 + 切换 20 次，无卡死模式 | ⬜ |
@@ -293,6 +304,8 @@ IDF 仓库保持只读参考。
 | A13 | MQTT 发现 | HA 自动出现 `light` 实体且状态可用 | ✅ |
 | A14 | Binding 主动上报 | 用手机 App 或墙壁开关改灯，网关 1~2 s 内收到 `REPORT_ATTR` | ⬜ |
 | A15 | 换设备通用性 | 换另一台同类 ZCL 灯，无需改代码即可被识别与控制 | ⬜ |
+| A16 | Matter over Thread 端到端 | Thread 设备（Matter 类型）配网成功，HA 中可开关/调光/调色温/调色，状态变化 1~2 s 内反映到 HA | ✅ |
+| A17 | TBR 稳定性 | `otbr-agent` 连续运行 ≥ 30 min，期间无 `RCP device disconnected (EOF)`、无 `Role xxx -> xxx` 跳变 | ⬜ |
 
 ---
 
@@ -346,6 +359,21 @@ IDF 仓库保持只读参考。
 21. **MQTT URI 里的特殊字符必须 URL 编码**：密码含 `@ : / #` 时写成 `%40 %3A %2F %23`，
     否则 `mqtt://user:pass@host:port` 会被错误拆分。
 22. **HA 实体依赖 `unique_id`**：没有它则 HA 重启后不会恢复实体；Discovery 必须 retained 或响应 birth（`homeassistant/status`）。
+23. **HAOS 的 OTBR app 配 H2 时必须关闭 Hardware flow control**：ESP32-H2 的 USB-Serial-JTAG 是 CDC-ACM，
+    不支持 UART 硬件流控。开了之后短帧能过（spinel RESET、读 HWADDR、attach 都成功），但持续通信会崩，
+    表现为 `otbr-agent` 反复退出重启、每次重建一个新 `Partition ID`、Thread 网络 30 秒一变。
+    官方文档建议"通信异常时切换 flow control"，对 ESP 是**反向**的——必须**关**。
+    配置：`device` 选 H2 的 by-id、`baudrate=115200`、`flow_control=false`。
+24. **`flow_control=false` 会让 addon 自动给 Radio URL 加 `&uart-init-deassert`**，它会 toggle DTR/RTS；
+    ESP32 的 ROM 层把 DTR/RTS 变化识别为复位/进下载模式信号，芯片一复位 USB-Serial-JTAG 就断开，
+    otbr-agent 读到 EOF 直接退出。日志特征：`exit(1): Read line 207, RCP device disconnected (EOF), Failure`。
+    杀掉这个参数没有配置项 → 只要它频繁触发，Thread 模式就得换成「S3 做 USB-UART 中继」的形态。
+25. **HA Thread 页面列出多个同名 border router 是 mDNS 残留**：`homeassistant-otbr.local.` 后接不同 `#XXXX`
+    的条目，是 otbr-agent 每次重启注册的新 `_meshcop._udp` 实例，旧记录不会撤回。判定同一实体的依据是
+    Extended PAN ID / Border Agent ID 相同，不是靠条目数量。
+26. **Matter Server 面板重复 commission 同一 node 会在输入 dataset 那一步就报错**：设备已配过网但
+    Matter Server 里还留着旧 node 时，再次添加在第一步就失败，容易被误判成 dataset 格式问题。
+    正确做法是先删旧 node，或先 factory reset 设备。
 
 ---
 
