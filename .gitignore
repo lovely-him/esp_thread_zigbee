@@ -2,6 +2,24 @@
 .vscode
 .tmp
 .env
+out
+logs
 
 #
 .github/skills/skill-serial-console
+
+# ESP-IDF 构建产物
+firmware/*/build
+firmware/*/build_*
+firmware/*/sdkconfig
+firmware/*/sdkconfig.old
+firmware/*/managed_components
+
+#
+firmware/*/build*
+dependencies.lock
+managed_components
+
+#
+logs
+out
