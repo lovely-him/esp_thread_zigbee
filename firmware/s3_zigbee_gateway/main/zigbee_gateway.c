@@ -45,6 +45,10 @@
 
 #include "ezbee/zha.h"
 #include "zigbee_gateway.h"
+#include "wifi_prov.h"
+#include "zb_dev.h"
+#include "zb_ctrl.h"
+#include "mqtt_bridge.h"
 
 static const char *TAG = "ZIGBEE_GATEWAY";
 
@@ -66,7 +70,10 @@ static esp_err_t esp_zigbee_connect_netif(void)
     esp_coex_wifi_i154_enable();
 #endif /* CONFIG_ESP_COEX_SW_COEXIST_ENABLE*/
 
-    ESP_RETURN_ON_ERROR(example_connect(), TAG, "Failed to connect to Network Interface");
+    ret = wifi_prov_connect();
+    if (ret != ESP_OK) {
+        return ret;
+    }
 
 #if CONFIG_EXAMPLE_CONNECT_WIFI
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(ps_type), TAG, "Failed to set power save type for Wi-Fi");
@@ -94,6 +101,35 @@ static void esp_zigbee_alarm_bdb_commissioning(alarm_timer_arg_t arg)
     esp_zigbee_lock_release();
 }
 
+static void on_device_discovered(const zb_dev_t *dev)
+{
+    zb_ctrl_bind_clusters(dev);
+    zb_ctrl_configure_reporting(dev);
+}
+
+static void zb_rescan_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    for (;;) {
+        zb_dev_rescan();
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        zb_dev_check_alive();
+        vTaskDelay(pdMS_TO_TICKS(50000));
+    }
+}
+
+static void ensure_rescan_task(void)
+{
+    static bool started = false;
+
+    if (started) {
+        return;
+    }
+    started = true;
+    xTaskCreate(zb_rescan_task, "zb_rescan", 3072, NULL, 3, NULL);
+}
+
 static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
 {
     ezb_app_signal_type_t signal_type = ezb_app_signal_get_type(app_signal);
@@ -115,6 +151,7 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
                 ezb_bdb_open_network(180);
                 ESP_LOGI(TAG, "Device reboot");
             }
+            ensure_rescan_task();
         } else {
             ESP_LOGW(TAG, "The %s failed with status(0x%02x), please retry", ezb_app_signal_to_string(signal_type), status);
             alarm_timer_schedule(esp_zigbee_alarm_bdb_commissioning, EZB_BDB_MODE_INITIALIZATION, 1000);
@@ -144,11 +181,12 @@ static bool esp_zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     } break;
     case EZB_ZDO_SIGNAL_DEVICE_ANNCE: {
         const ezb_zdo_signal_device_annce_params_t *dev_annce_params = ezb_app_signal_get_params(app_signal);
-        ESP_LOGI(TAG, "New device commissioned or rejoined (short: 0x%04hx)", dev_annce_params->short_addr);
+        zb_dev_handle_annce(dev_annce_params);
     } break;
     case EZB_ZDO_SIGNAL_LEAVE_INDICATION: {
         const ezb_zdo_signal_leave_indication_params_t *leave_ind_params = ezb_app_signal_get_params(app_signal);
         ESP_LOGI(TAG, "Zigbee Node(0x%04hx) is leaving network", leave_ind_params->short_addr);
+        zb_dev_handle_leave(leave_ind_params);
     } break;
     case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS: {
         uint8_t duration = *(uint8_t *)ezb_app_signal_get_params(app_signal);
@@ -188,6 +226,22 @@ static void esp_zigbee_zcl_core_action_handler(ezb_zcl_core_action_callback_id_t
     case EZB_ZCL_CORE_DEFAULT_RSP_CB_ID: {
         ezb_zcl_cmd_default_rsp_message_t *default_rsp = (ezb_zcl_cmd_default_rsp_message_t *)message;
         ESP_LOGI(TAG, "Received ZCL Default Response with status(0x%02x)", default_rsp->in.status_code);
+    } break;
+    case EZB_ZCL_CORE_READ_ATTR_RSP_CB_ID:
+        zb_dev_handle_read_rsp((const ezb_zcl_cmd_read_attr_rsp_message_t *)message);
+        break;
+    case EZB_ZCL_CORE_REPORT_ATTR_CB_ID:
+        zb_dev_handle_report((const ezb_zcl_cmd_report_attr_message_t *)message);
+        break;
+    case EZB_ZCL_CORE_CONFIG_REPORT_RSP_CB_ID: {
+        const ezb_zcl_cmd_config_report_rsp_message_t *rsp =
+            (const ezb_zcl_cmd_config_report_rsp_message_t *)message;
+        if (rsp->in.variables == NULL || rsp->in.variables->status != EZB_ZCL_STATUS_SUCCESS) {
+            for (const ezb_zcl_config_report_rsp_variable_t *v = rsp->in.variables; v != NULL;
+                 v = v->next) {
+                ESP_LOGW(TAG, "设备拒绝上报配置 attr=0x%04x status=0x%02x", v->attr_id, v->status);
+            }
+        }
     } break;
     default:
         ESP_LOGW(TAG, "ZCL Core Action: ID(0x%04lx)", callback_id);
@@ -241,7 +295,15 @@ static void esp_zigbee_stack_main_task(void *pvParameters)
 #endif
 
 #if (CONFIG_EXAMPLE_CONNECT_WIFI || CONFIG_EXAMPLE_CONNECT_ETHERNET)
-    ESP_ERROR_CHECK(esp_zigbee_connect_netif());
+    const esp_err_t netif_err = esp_zigbee_connect_netif();
+    if (netif_err == WIFI_PROV_AP_MODE) {
+        ESP_LOGW(TAG, "等待 Wi-Fi 配网：连 ESP-ZB-GW-XXXX 后打开 http://192.168.4.1/");
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+    ESP_ERROR_CHECK(netif_err);
+    mqtt_bridge_start();
 #endif
 
     ESP_ERROR_CHECK(esp_zigbee_setup_commissioning());
@@ -276,6 +338,10 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(5000));
         }
     }
+
+    zb_dev_restore();
+    zb_dev_set_state_cb(mqtt_bridge_on_state);
+    zb_dev_set_discovered_cb(on_device_discovered);
 
     ESP_LOGI(TAG, "Start ESP Zigbee Stack");
     xTaskCreate(esp_zigbee_stack_main_task, "Zigbee_main", 4096 * 2, NULL, 5, NULL);

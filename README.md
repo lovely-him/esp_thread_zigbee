@@ -14,7 +14,7 @@
 | 模式 | H2 角色 | S3 角色 | 对外接口 |
 | --- | --- | --- | --- |
 | **Thread 模式** | USB RCP（spinel/HDLC over USB-Serial-JTAG） | 引导程序空转常驻（不参与无线电，保持在线以便按 RESET 重入选择窗口） | HAOS 的 OpenThread Border Router add-on 直连 H2 的 `/dev/ttyACM*` |
-| **Zigbee 模式** | UART RCP（spinel over 板内 UART @460800） | 运行 Zigbee 网关（Wi-Fi 回程） | 无对外桥接接口（本工程只验收「Zigbee 网络可用」） |
+| **Zigbee 模式** | UART RCP（spinel over 板内 UART @460800） | Zigbee 网关 + MQTT 桥（Wi-Fi 回程） | MQTT → HAOS MQTT 集成，自动发现 `light` 实体 |
 
 **非目标**（已论证不可行，不再尝试）：
 
@@ -74,7 +74,7 @@
 - H2 固件 = `ot_rcp` 变体，`CONFIG_OPENTHREAD_RCP_UART=y`（默认 UART RCP）。
 - **同样由 S3 间接烧录**（同一套 GPIO 与 UART 通路）。
 - S3 运行 Zigbee 网关固件（基于 `esp_zigbee_sdk` 的 `zigbee_gateway` 例程改造），
-  经板内 UART 与 H2 建立 spinel 通信，Wi-Fi 回程到家庭局域网。
+  经板内 UART 与 H2 建立 spinel 通信，Wi-Fi 回程，并通过 MQTT 把子设备暴露给 HAOS（R6、R7）。
 
 ### R4 — S3 存储布局
 
@@ -109,6 +109,62 @@ rcp_fw,     data, spiffs,  0x3A0000,  0x100000
 `rcp_fw` 里是 SPIFFS 文件系统，两份镜像以目录区分，不是两个分区。
 
 尾部 `0x4A0000 ~ 0x800000` 约 3.4 MB 未分配。
+
+### R5 — SoftAP 首次配网
+
+| 场景 | 行为 |
+| --- | --- |
+| NVS 无 Wi-Fi 凭据 | 直接开热点（不做无意义重试） |
+| 有凭据，连接成功 | 连上后进入正常流程 |
+| 有凭据，连不上 | 重试 10 次 / 20 s 超时 → 转 SoftAP |
+| 配网模式 | 起 HTTP 服务，**不进 Zigbee 栈**、不 panic、不重启循环 |
+| 提交表单 | 写 NVS → 1.5 s 后重启 |
+
+- 热点名 `ESP-ZB-GW-<MAC 后 3 字节>`（开放网络），浏览器打开 `http://192.168.4.1/`。
+- 表单字段：Wi-Fi SSID、密码、**MQTT 地址**（可留空，留空则沿用已存值）。
+- **STA 模式也常驻配置页**（`http://<设备IP>/`），用来只改 MQTT 而不必重新配网。
+- 仅支持 **2.4 GHz**；路由器 2.4G/5G 同名时首轮 auth 可能被拒，靠重试自动上去。
+
+### R6 — Zigbee 子设备管理
+
+| 环节 | 实现 |
+| --- | --- |
+| 发现 | `EZB_ZDO_SIGNAL_DEVICE_ANNCE` → `ezb_zdo_active_ep_req` → 逐端点 `ezb_zdo_simple_desc_req` |
+| 设备表 | 以 **IEEE 64-bit** 为键（不是短地址），最多 16 台；短地址变化时按 IEEE 匹配更新 |
+| 能力判定 | 只看端点 cluster：`0x0006 OnOff` / `0x0008 Level` / `0x0300 ColorControl`；颜色是否支持 XY / CT 由**读属性实测**决定 |
+| 绑定 | 对 OnOff / Level / ColorControl 建 Binding（源 = 设备 IEEE+EP，目的 = 本机 IEEE + EP10） |
+| 上报配置 | `Configure Reporting`：OnOff、Level、ColorX、ColorY、ColorTempMireds、ColorMode |
+| 状态读取 | 读 OnOff `0x0000`、Level `0x0000`、Color `0x0003/0x0004/0x0007/0x0008/0x400b/0x400c` |
+| 探活 | 网络就绪 5 s 后 + 每 60 s；8 s 无响应标记离线 |
+| 持久化 | NVS `zigbee`/`devs`（带 version）；只存 IEEE/short/ep/caps，**状态不持久化** |
+
+**设备类型范围（当前）**：只映射成 HA 的 `light`。
+任何带 OnOff 的 ZCL 设备都能被控制，但 discovery 一律按 `light` 发布；
+传感器类设备（无 OnOff/Level/Color）会被发现并记入设备表，但**不发布任何实体**。
+
+### R7 — MQTT 桥
+
+| 项 | 约定 |
+| --- | --- |
+| broker | 配网页填写的 URI，存 NVS `wifi_cfg`/`mqtt_uri`；未配置则跳过 MQTT |
+| Discovery | `homeassistant/light/zbgw_<ieee>/config`（retained） |
+| 状态 | `zbgw/light/<ieee>/state`（retained，JSON） |
+| 命令 | `zbgw/light/<ieee>/set`（JSON） |
+| 可用性 | `zbgw/light/<ieee>/avail`（`online`/`offline`）；网关级 LWT 为 `zbgw/status` |
+| schema | `json`；`brightness_scale: 254`（直接对齐 ZCL CurrentLevel） |
+| 能力声明 | `supported_color_modes` 按实测能力生成：`["color_temp","xy"]` / `["brightness"]` / `["onoff"]` … |
+| 色温范围 | `min_mireds`/`max_mireds` 取自设备 `0x400b`/`0x400c`，读不到才用 153/500 兜底 |
+| birth | 订阅 `homeassistant/status`，收到后重发全部 Discovery |
+
+命令与状态示例：
+
+```json
+/* set */    {"state":"ON"}
+/* set */    {"brightness":128}          /* 0-254 */
+/* set */    {"color":{"x":0.42,"y":0.35}}
+/* set */    {"color_temp":300}          /* mireds */
+/* state */  {"state":"ON","brightness":128,"color_mode":"xy","color":{"x":0.42,"y":0.35}}
+```
 
 ---
 
@@ -149,6 +205,29 @@ rcp_fw,     data, spiffs,  0x3A0000,  0x100000
 | `firmware/s3_boot` | 自研（ESP-IDF 基础模板） | R4-#1 引导程序 |
 | `firmware/s3_zigbee_gateway` | `esp-zigbee-sdk` v2 `examples/zigbee_gateway` 改造 | R4-#2 Zigbee 网关 |
 | `components/mode_select` | 自研 | 按钮窗口检测（1 s 起采、5 s 窗、长按 ≥2 s）+ 模式状态 + app 分区切换，两个 app 共用 |
+
+`firmware/s3_zigbee_gateway/main/` 模块划分：
+
+| 文件 | 职责 |
+| --- | --- |
+| `zigbee_gateway.c` | 例程主体：Zigbee 栈启动、信号处理、ZCL action 回调分派 |
+| `wifi_prov.c` | R5 配网：NVS 凭据、SoftAP、HTTP 表单、运行期配置页 |
+| `zb_dev.c` | R6 设备表、发现流程、状态缓存、探活、属性回报处理 |
+| `zb_ctrl.c` | 命令下发（OnOff / Level / Color）、Binding、Configure Reporting |
+| `mqtt_bridge.c` | R7 MQTT 连接、Discovery、命令解析、状态发布 |
+
+脚本（`script/<命令>/<命令>.sh`，每个命令一个目录）：
+
+| 命令 | 用途 |
+| --- | --- |
+| `script/probe/probe.sh` | `env` / `ports` / `list`：by-id 解析 H2、S3 端口 |
+| `script/build-h2/build-h2.sh` | 编译 H2 的 `thread_usb` / `zigbee_uart` 变体 |
+| `script/build-s3/build-s3.sh` | 编译 Zigbee 网关（目标 `ota_0`） |
+| `script/build-boot/build-boot.sh` | 编译引导程序（目标 `factory`） |
+| `script/pack-rcp/pack-rcp.sh` | 打包两份 H2 镜像为 SPIFFS 镜像 `out/rcp_fw.bin` |
+| `script/flash-s3/flash-s3.sh` | 烧写 S3 全部分区（`--erase` 先整片擦除） |
+| `script/verify-thread/verify-thread.sh` | 用官方 otbr-agent 验证 Thread 模式 USB RCP |
+| `script/gen-cpp-index/gen-cpp-index.sh` | 生成 `.vscode/c_cpp_properties.json`（每个工程一个 configuration） |
 
 **禁止在 `$IDF_PATH/examples/` 下直接编译**：例程一律拷贝到本仓库 `firmware/` 内再构建，
 IDF 仓库保持只读参考。
@@ -195,23 +274,29 @@ IDF 仓库保持只读参考。
 
 ## 8. 验收标准
 
-| 编号 | 验收项 | 判据 |
-| --- | --- | --- |
-| A1 | 纯上电不按 BOOT | 3 次上电，模式保持不变，H2 固件与模式匹配 |
-| A2 | 长按切换 | 窗口内长按 BOOT 2 s，Thread→Zigbee→Thread 各 5 次，每次重启后模式正确、H2 固件正确 |
-| A3 | 间接烧录 | 全程不使用 esptool 直连 H2 烧固件（Thread 模式下 USB1 仅作为 HAOS 的数据口），H2 仍能复位并升级 |
-| A4 | Thread 闭环 | HAOS OTBR add-on 日志出现 `RCP_HOS` + `Set state callback: OK` + `BorderAgent Registering service` |
-| A5 | Zigbee 闭环 | S3 日志 `ESP_RADIO_SPINEL ... enabled`、RCP 版本为 `esp32h2`、Sta IP 获取成功、Zigbee 网络形成 |
-| A6 | 刷写失败可恢复 | 切换途中拔电/超时，下次上电自动重试，不死循环、不变砖 |
-| A7 | 稳定性 | 反复上电 20 次 + 切换 20 次，无卡死模式 |
-| A8 | 窗口外不响应 | 启动 10 s 后长按 BOOT 5 s，模式不变 |
-| A9 | 版本比对生效 | 同一模式连续上电 3 次，第 2、3 次串口日志无 H2 刷写记录，启动耗时明显短于首次 |
+状态标记：✅ 已实测通过 ｜ ⚠ 部分通过 ｜ ⬜ 未验证
+
+| 编号 | 验收项 | 判据 | 状态 |
+| --- | --- | --- | --- |
+| A1 | 纯上电不按 BOOT | 3 次上电，模式保持不变，H2 固件与模式匹配 | ✅ |
+| A2 | 长按切换 | 窗口内长按 BOOT 2 s，Thread→Zigbee→Thread 各 5 次，每次重启后模式正确、H2 固件正确 | ✅ |
+| A3 | 间接烧录 | 全程不使用 esptool 直连 H2 烧固件（Thread 模式下 USB1 仅作为 HAOS 的数据口），H2 仍能复位并升级 | ✅ |
+| A4 | Thread 闭环 | HAOS OTBR add-on 日志出现 `RCP_HOS` + `Set state callback: OK` + `BorderAgent Registering service` | ⚠ 仅验证到 otbr-agent 侧，HAOS 的 OTBR add-on 未验证 |
+| A5 | Zigbee 闭环 | S3 日志 `ESP_RADIO_SPINEL ... enabled`、RCP 版本为 `esp32h2`、Sta IP 获取成功、Zigbee 网络形成 | ✅ |
+| A6 | 刷写失败可恢复 | 切换途中拔电/超时，下次上电自动重试，不死循环、不变砖 | ⬜ |
+| A7 | 稳定性 | 反复上电 20 次 + 切换 20 次，无卡死模式 | ⬜ |
+| A8 | 窗口外不响应 | 启动 10 s 后长按 BOOT 5 s，模式不变 | ⬜ |
+| A9 | 版本比对生效 | 同一模式连续上电 3 次，第 2、3 次串口日志无 H2 刷写记录 | ✅ |
+| A10 | SoftAP 配网 | 无凭据时热点可达、表单可提交、重启后连上 | ✅ |
+| A11 | 子设备发现 | 入网后打印端点与簇列表，颜色能力由属性探测得出 | ✅ |
+| A12 | 灯控制 | HA 里开关 / 亮度 / 色温 / 颜色四项均生效 | ✅ |
+| A13 | MQTT 发现 | HA 自动出现 `light` 实体且状态可用 | ✅ |
+| A14 | Binding 主动上报 | 用手机 App 或墙壁开关改灯，网关 1~2 s 内收到 `REPORT_ATTR` | ⬜ |
+| A15 | 换设备通用性 | 换另一台同类 ZCL 灯，无需改代码即可被识别与控制 | ⬜ |
 
 ---
 
 ## 9. 定稿决策
-
-以下 8 条已拍板，不再讨论：
 
 | 编号 | 议题 | 定稿 |
 | --- | --- | --- |
@@ -221,8 +306,12 @@ IDF 仓库保持只读参考。
 | D4 | 切换后按键未松开的自激 | **不处理**，写进操作说明要求松手；自激行为已接受（见 R1） |
 | D5 | Thread 模式下 S3 做什么 | **空转常驻**，不进 deep sleep；要重选模式按 S3 RESET 重入窗口 |
 | D6 | 每次上电是否重刷 H2 | **比对 RCP 镜像版本字符串 + 已刷入模式**，一致则跳过，不一致才刷 |
-| D7 | Zigbee 侧范围 | 仅做到「Zigbee 网络可用 + S3 ↔ H2 spinel 通」；**MQTT / HA Discovery 实体桥接不在本工程范围** |
+| D7 | Zigbee 侧范围 | **含 MQTT 桥 + HA Discovery** |
 | D8 | 是否保留 OTA | **不保留**，不设 `ota_1`；app 分区只有 `factory` 与 `ota_0` |
+| D9 | 颜色模式（XY/CT）如何判定 | **通用规则**：只看本轮**值真的变化**的颜色属性——只有 `CurrentX/Y` 变→XY，只有 `ColorTempMireds` 变→CT，都变或都没变则保持。**不用 `ColorMode` 属性判断模式**，仅在它与推导值不一致时告警 |
+| D10 | MQTT 暴露哪些设备类型 | **只做 `light`**。带 OnOff 的 ZCL 设备都能控制，但一律按 light 发布；新增 `switch`/`sensor` 属后续扩展 |
+| D11 | 设备不合规怎么处理 | **告警，不改逻辑**。不做设备型号特化分支，不用"因为某厂商会这样"而改变通用规则 |
+
 
 ---
 
@@ -242,6 +331,21 @@ IDF 仓库保持只读参考。
 10. **IDF 的 `export.sh` 在 `set -u` 下会中断调用方**，脚本里 `source` 前需 `set +u`、事后 `set -u`。
 11. **SPIFFS 分区必须一次写入两份镜像**：切到缺镜像的模式会直接 `ESP_ERR_NOT_FOUND`，表现为该模式永远起不来。
 12. **每次切换都写一次 `otadata`**（`esp_ota_set_boot_partition`），是切 app 的必付代价；切换频率低，磨损可忽略，但不要在循环里反复调。
+13. **只配 Configure Reporting 不够，必须先建 Binding**：ZCL 的 `Report Attributes` 是经 binding 表投递的，
+    没有 binding 时设备只会"看心情"发给最后配置它的一方，表现为上报时有时无。
+14. **`ColorMode (0x0300/0x0008)` 在实践中不可靠**：多数灯具在 `MoveToColor` 后不同步该属性；
+    部分设备还会以 `0x89 INSUFFICIENT_SPACE` 拒绝为它配置上报。因此模式判定不用它（D9），只做一致性告警。
+15. **探活会反复读属性，写 NVS 必须按"变化"判断**：无条件 `dev_save()` 会一天写上千次 flash。
+16. **子设备不会因为网关重启而重新 Announce**：协调器沿用 NVS 里的网络参数，设备认为网络没变。
+    网关重启后必须靠**主动探活**恢复，不能等 `DEVICE_ANNCE`。
+17. **短地址会变**：设备 rejoin 后短地址可能变化，设备表必须用 IEEE 作键，收到 annce 时按 IEEE 更新短地址。
+18. **状态采用"命令即状态 + 读取覆盖"**：命令下发成功即更新本地并推 MQTT（否则延迟应答设备会让 HA 卡住），
+    之后由上报/探活覆盖。`MoveToLevelWithOnOff` 会开灯，所以设亮度时同时置 `on=true`。
+19. **多端点设备目前只取第一个带 OnOff 的端点**（`dev->ep` 只存一个），多路开关/多路灯只会控制第一路。
+20. **设备表上限 16 台**，单网关。
+21. **MQTT URI 里的特殊字符必须 URL 编码**：密码含 `@ : / #` 时写成 `%40 %3A %2F %23`，
+    否则 `mqtt://user:pass@host:port` 会被错误拆分。
+22. **HA 实体依赖 `unique_id`**：没有它则 HA 重启后不会恢复实体；Discovery 必须 retained 或响应 birth（`homeassistant/status`）。
 
 ---
 
@@ -251,3 +355,6 @@ IDF 仓库保持只读参考。
 - `esp_rcp_update` API：<https://docs.espressif.com/projects/esp-thread-br/en/latest/api-reference/esp_rcp_update.html>
 - RCP 更新机制：<https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/rcp_update.html>
 - esp-zigbee-sdk：<https://github.com/espressif/esp-zigbee-sdk>
+- esp-zigbee-sdk API（ZDO / ZCL / 各 cluster）：<https://docs.espressif.com/projects/esp-zigbee-sdk/en/latest/esp32/api-reference/esp_zigbee_core/zcl/zcl_general_command.html>
+- HA MQTT 集成与 Discovery：<https://www.home-assistant.io/integrations/mqtt/>
+- HA MQTT Light（json schema）：<https://www.home-assistant.io/integrations/light.mqtt/>
